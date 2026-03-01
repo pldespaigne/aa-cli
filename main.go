@@ -1,37 +1,17 @@
 package main
 
 import (
-	"encoding/json"
+	"fmt"
 	"log"
-	"net/http"
+
+	"github.com/pldespaigne/aa-cli/pkg/config"
 )
 
-type Post struct {
-	UserId int    `json:"userId"`
-	Id     int    `json:"id"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-}
-
 func main() {
-	url := "https://jsonplaceholder.typicode.com/posts/1"
-
-	resp, err := http.Get(url)
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Error fetching data: %v", err)
+		log.Fatalf("Config validation failed: %v", err)
 	}
 
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Error: received non-OK HTTP status %d", resp.StatusCode)
-	}
-
-	var post Post
-	err = json.NewDecoder(resp.Body).Decode(&post)
-	if err != nil {
-		log.Fatalf("Error decoding JSON: %v", err)
-	}
-
-	log.Printf("Post ID: %d, Title: %s", post.Id, post.Title)
+	fmt.Printf("Loaded Config: %+v\n", cfg)
 }
