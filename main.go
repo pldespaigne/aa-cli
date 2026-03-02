@@ -46,36 +46,14 @@ func main() {
 		Transactions []TxData `json:"transactions"`
 	}
 
+	blocks, err := envio.ExecuteAll[BlockData](client, query)
+	if err != nil {
+		log.Fatalf("Failed to execute query: %v", err)
+	}
+
 	var txs []TxData
-	i := 0
-	for {
-		if i > 10 {
-			log.Printf("Reached maximum pagination limit, stopping")
-			break
-		}
-
-		result, err := envio.Execute[BlockData](client, query)
-		if err != nil {
-			log.Fatalf("Failed to execute query: %v", err)
-		}
-
-		for _, block := range result.Data {
-			txs = append(txs, block.Transactions...)
-		}
-
-		if result.ArchiveHeight == nil {
-			log.Printf("Archive height not available, stopping pagination")
-			break
-		}
-
-		log.Printf("Progress: block %d / %d", result.NextBlock, *result.ArchiveHeight)
-
-		if result.NextBlock+10 >= *result.ArchiveHeight {
-			break
-		}
-
-		query.FromBlock = result.NextBlock
-		i++
+	for _, block := range blocks {
+		txs = append(txs, block.Transactions...)
 	}
 
 	log.Printf("Total transactions: %d", len(txs))

@@ -105,15 +105,29 @@ type EnvioResponse[T any] struct {
 }
 
 type EnvioClient struct {
-	ChainId  uint64
-	ApiToken string
+	ChainId       uint64
+	ApiToken      string
+	NearTipMargin uint64
 }
 
-func NewEnvioClient(chainId uint64, apiToken string) *EnvioClient {
-	return &EnvioClient{
-		ChainId:  chainId,
-		ApiToken: apiToken,
+type EnvioClientOption func(*EnvioClient)
+
+func WithNearTipMargin(margin uint64) EnvioClientOption {
+	return func(c *EnvioClient) {
+		c.NearTipMargin = margin
 	}
+}
+
+func NewEnvioClient(chainId uint64, apiToken string, opts ...EnvioClientOption) *EnvioClient {
+	c := &EnvioClient{
+		ChainId:       chainId,
+		ApiToken:      apiToken,
+		NearTipMargin: 1,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 func Execute[T any](c *EnvioClient, q EnvioQuery) (*EnvioResponse[T], error) {
@@ -151,6 +165,32 @@ func Execute[T any](c *EnvioClient, q EnvioQuery) (*EnvioResponse[T], error) {
 	}
 
 	return &result, nil
+}
+
+func ExecuteAll[T any](c *EnvioClient, q EnvioQuery) ([]T, error) {
+	var all []T
+	for {
+		result, err := Execute[T](c, q)
+		if err != nil {
+			return nil, err
+		}
+
+		all = append(all, result.Data...)
+
+		if result.ArchiveHeight == nil {
+			log.Printf("Archive height not available, stopping pagination")
+			break
+		}
+
+		log.Printf("Progress: block %d / %d", result.NextBlock, *result.ArchiveHeight)
+
+		if result.NextBlock+c.NearTipMargin >= *result.ArchiveHeight {
+			break
+		}
+
+		q.FromBlock = result.NextBlock
+	}
+	return all, nil
 }
 
 type Authorization struct {
