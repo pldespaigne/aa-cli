@@ -9,7 +9,7 @@ import (
 )
 
 type Config struct {
-	EnvioApiToiken string `env:"ENVIO_API_TOKEN,required"`
+	EnvioApiToken string `env:"ENVIO_API_TOKEN,required"`
 }
 
 func LoadConfig() (*Config, error) {
