@@ -2,35 +2,32 @@ package envio
 
 import (
 	"bytes"
-	"encoding/binary"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/cenkalti/backoff/v5"
 )
 
-type EnvioJoinMode string
+type JoinMode string
 
 const (
-	DefaultMode     EnvioJoinMode = "Default"
-	JoinAllMode     EnvioJoinMode = "JoinAll"
-	JoinNothingMode EnvioJoinMode = "JoinNothing"
+	DefaultMode     JoinMode = "Default"
+	JoinAllMode     JoinMode = "JoinAll"
+	JoinNothingMode JoinMode = "JoinNothing"
 )
 
-type EnvioLogSelection struct {
+type LogSelection struct {
 	Address []string   `json:"address"`
 	Topics  [][]string `json:"topics"`
 }
 
-type EnvioTransactionSelection struct {
+type TransactionSelection struct {
 	From    []string `json:"from"`
 	To      []string `json:"to"`
 	SigHash []string `json:"sigHash"`
@@ -42,13 +39,13 @@ type EnvioTransactionSelection struct {
 	ContractAddress []string `json:"contract_address"`
 }
 
-type EnvioBlockSelection struct {
+type BlockSelection struct {
 	Hash []string `json:"hash"`
 
 	Miner []string `json:"miner"`
 }
 
-type EnvioTraceSelection struct {
+type TraceSelection struct {
 	From    []string `json:"from"`
 	To      []string `json:"to"`
 	Address []string `json:"address"`
@@ -62,33 +59,33 @@ type EnvioTraceSelection struct {
 	SigHash []string `json:"sighash"`
 }
 
-type EnvioFieldSelection struct {
+type FieldSelection struct {
 	Block       *[]string `json:"block,omitempty"`
 	Transaction *[]string `json:"transaction,omitempty"`
 	Log         *[]string `json:"log,omitempty"`
 	Trace       *[]string `json:"trace,omitempty"`
 }
 
-type EnvioQuery struct {
+type Query struct {
 	FromBlock uint64  `json:"from_block"`
 	ToBlock   *uint64 `json:"to_block,omitempty"`
 
-	Logs         []EnvioLogSelection         `json:"logs"`
-	Transactions []EnvioTransactionSelection `json:"transactions"`
-	Traces       []EnvioTraceSelection       `json:"traces"`
+	Logs         []LogSelection         `json:"logs"`
+	Transactions []TransactionSelection `json:"transactions"`
+	Traces       []TraceSelection       `json:"traces"`
 
-	IncludeAllblocks bool                `json:"include_all_blocks"`
-	FieldSelection   EnvioFieldSelection `json:"field_selection"`
+	IncludeAllBlocks bool           `json:"include_all_blocks"`
+	FieldSelection   FieldSelection `json:"field_selection"`
 
 	MaxNumBlocks       *uint `json:"max_num_blocks,omitempty"`
 	MaxNumTransactions *uint `json:"max_num_transactions,omitempty"`
 	MaxNumLogs         *uint `json:"max_num_logs,omitempty"`
 	MaxNumTraces       *uint `json:"max_num_traces,omitempty"`
 
-	JoinMode EnvioJoinMode `json:"join_mode"`
+	JoinMode JoinMode `json:"join_mode"`
 }
 
-type EnvioRollbackGuard struct {
+type RollbackGuard struct {
 	BlockNumber      uint64 `json:"block_number"`
 	Timestamp        uint64 `json:"timestamp"`
 	Hash             string `json:"hash"`
@@ -96,33 +93,85 @@ type EnvioRollbackGuard struct {
 	FirstParentHash  string `json:"first_parent_hash"`
 }
 
-type EnvioResponse[T any] struct {
-	ArchiveHeight      *uint64             `json:"archive_height,omitempty"`
-	NextBlock          uint64              `json:"next_block"`
-	TotalExecutionTime uint64              `json:"total_execution_time"`
-	Data               []T                 `json:"data"`
-	RollbackGuard      *EnvioRollbackGuard `json:"rollback_guard,omitempty"`
+type Response[T any] struct {
+	ArchiveHeight      *uint64        `json:"archive_height,omitempty"`
+	NextBlock          uint64         `json:"next_block"`
+	TotalExecutionTime uint64         `json:"total_execution_time"`
+	Data               []T            `json:"data"`
+	RollbackGuard      *RollbackGuard `json:"rollback_guard,omitempty"`
 }
 
-type EnvioClient struct {
-	ChainId       uint64
-	ApiToken      string
-	NearTipMargin uint64
+type Querier interface {
+	QueryRaw(ctx context.Context, q Query) ([]byte, error)
 }
 
-type EnvioClientOption func(*EnvioClient)
+type Client struct {
+	apiToken   string
+	baseUrl    string
+	httpClient *http.Client
+	logger     *slog.Logger
 
-func WithNearTipMargin(margin uint64) EnvioClientOption {
-	return func(c *EnvioClient) {
-		c.NearTipMargin = margin
+	maxRetries           uint
+	retryInitialInterval time.Duration
+	retryMaxInterval     time.Duration
+	retryMaxElapsedTime  time.Duration
+}
+
+type ClientOption func(*Client)
+
+func WithBaseUrl(url string) ClientOption {
+	return func(c *Client) {
+		c.baseUrl = url
 	}
 }
 
-func NewEnvioClient(chainId uint64, apiToken string, opts ...EnvioClientOption) *EnvioClient {
-	c := &EnvioClient{
-		ChainId:       chainId,
-		ApiToken:      apiToken,
-		NearTipMargin: 1,
+func WithTimeout(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.httpClient.Timeout = d
+	}
+}
+
+func WithLogger(l *slog.Logger) ClientOption {
+	return func(c *Client) {
+		c.logger = l
+	}
+}
+
+func WithRetryMaxTries(n uint) ClientOption {
+	return func(c *Client) {
+		c.maxRetries = n
+	}
+}
+
+func WithRetryInitialInterval(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryInitialInterval = d
+	}
+}
+
+func WithRetryMaxInterval(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryMaxInterval = d
+	}
+}
+
+func WithRetryMaxElapsedTime(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.retryMaxElapsedTime = d
+	}
+}
+
+func NewClient(apiToken string, opts ...ClientOption) *Client {
+	c := &Client{
+		apiToken:   apiToken,
+		baseUrl:    "https://1.hypersync.xyz",
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		logger:     slog.Default(),
+
+		maxRetries:           5,
+		retryInitialInterval: 500 * time.Millisecond,
+		retryMaxInterval:     30 * time.Second,
+		retryMaxElapsedTime:  2 * time.Minute,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -130,36 +179,91 @@ func NewEnvioClient(chainId uint64, apiToken string, opts ...EnvioClientOption) 
 	return c
 }
 
-func Execute[T any](c *EnvioClient, q EnvioQuery) (*EnvioResponse[T], error) {
-	url := fmt.Sprintf("https://%d.hypersync.xyz/query", c.ChainId)
+func (c *Client) GetLogger() *slog.Logger {
+	return c.logger
+}
+
+func (c *Client) QueryRaw(ctx context.Context, q Query) ([]byte, error) {
+	url := c.baseUrl + "/query"
 
 	jsonData, err := json.Marshal(q)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal query: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = c.retryInitialInterval
+	bo.MaxInterval = c.retryMaxInterval
+
+	operation := func() ([]byte, error) {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return nil, backoff.Permanent(fmt.Errorf("failed to create request: %w", err))
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiToken)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			// Network errors are retryable
+			return nil, fmt.Errorf("failed to execute request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			return bodyBytes, nil
+		}
+
+		apiErr := fmt.Errorf("hypersync API error: status %d, body: %s", resp.StatusCode, string(bodyBytes))
+
+		// 429 Too Many Requests: honour Retry-After header if present
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if seconds, err := strconv.Atoi(ra); err == nil {
+					return nil, backoff.RetryAfter(seconds)
+				}
+			}
+			return nil, apiErr // retryable with normal backoff
+		}
+
+		// 5xx Server errors: retryable
+		if resp.StatusCode >= 500 {
+			return nil, apiErr
+		}
+
+		// All other 4xx: not retryable
+		return nil, backoff.Permanent(apiErr)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.ApiToken)
-
-	httpClient := &http.Client{Timeout: 60 * time.Second}
-	resp, err := httpClient.Do(req)
+	result, err := backoff.Retry(ctx, operation,
+		backoff.WithBackOff(bo),
+		backoff.WithMaxTries(c.maxRetries),
+		backoff.WithMaxElapsedTime(c.retryMaxElapsedTime),
+		backoff.WithNotify(func(err error, next time.Duration) {
+			c.logger.Warn("retrying hypersync request", "error", err, "next_retry_in", next)
+		}),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, err
 	}
 
-	var result EnvioResponse[T]
-	err = json.Unmarshal(bodyBytes, &result)
+	return result, nil
+}
+
+func Execute[T any](ctx context.Context, q Querier, query Query) (*Response[T], error) {
+	raw, err := q.QueryRaw(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+
+	var result Response[T]
+	err = json.Unmarshal(raw, &result)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
@@ -167,10 +271,10 @@ func Execute[T any](c *EnvioClient, q EnvioQuery) (*EnvioResponse[T], error) {
 	return &result, nil
 }
 
-func ExecuteAll[T any](c *EnvioClient, q EnvioQuery) ([]T, error) {
+func ExecuteAll[T any](ctx context.Context, q Querier, query Query, logger *slog.Logger) ([]T, error) {
 	var all []T
 	for {
-		result, err := Execute[T](c, q)
+		result, err := Execute[T](ctx, q, query)
 		if err != nil {
 			return nil, err
 		}
@@ -178,167 +282,17 @@ func ExecuteAll[T any](c *EnvioClient, q EnvioQuery) ([]T, error) {
 		all = append(all, result.Data...)
 
 		if result.ArchiveHeight == nil {
-			log.Printf("Archive height not available, stopping pagination")
+			logger.Warn("archive height not available, stopping pagination")
 			break
 		}
 
-		log.Printf("Progress: block %d / %d", result.NextBlock, *result.ArchiveHeight)
+		logger.Info("pagination progress", "next_block", result.NextBlock, "archive_height", *result.ArchiveHeight)
 
-		if result.NextBlock+c.NearTipMargin >= *result.ArchiveHeight {
+		if result.NextBlock >= *result.ArchiveHeight {
 			break
 		}
 
-		q.FromBlock = result.NextBlock
+		query.FromBlock = result.NextBlock
 	}
 	return all, nil
-}
-
-type Authorization struct {
-	ChainId         string
-	ContractAddress string
-	Nonce           string
-	YParity         string
-	R               string
-	S               string
-	Hash            string
-	Authority       string
-}
-
-// Envio indexer has a bug in the way the store/formats the authorization list
-func DecodeAuthorizationList(authList string) ([]Authorization, error) {
-	// if the string starts with 0x, remove it
-	authList = strings.TrimPrefix(authList, "0x")
-
-	// verify that the string is a valid hex string
-	decodedBytes, err := hex.DecodeString(authList)
-	if err != nil {
-		return nil, fmt.Errorf("invalid hex string: %v", err)
-	}
-	if len(decodedBytes) < 8 {
-		return nil, fmt.Errorf("invalid authorization list: expected at least 8 bytes, got %d", len(decodedBytes))
-	}
-
-	// the first 8 bytes represent the length of the list
-	listLength := binary.LittleEndian.Uint64(decodedBytes[:8])
-
-	result := make([]Authorization, 0, listLength)
-
-	currentIndex := uint64(8)
-	for range listLength {
-		auth := Authorization{}
-
-		chainIdLength := binary.LittleEndian.Uint64(decodedBytes[currentIndex : currentIndex+8])
-		currentIndex += 8
-
-		auth.ChainId = string(decodedBytes[currentIndex : currentIndex+chainIdLength])
-		chainId, err := strconv.ParseUint(strings.TrimPrefix(auth.ChainId, "0x"), 16, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid chain ID: %v", err)
-		}
-		currentIndex += chainIdLength
-
-		contractAddressLength := binary.LittleEndian.Uint64(decodedBytes[currentIndex : currentIndex+8])
-		currentIndex += 8
-
-		auth.ContractAddress = string(decodedBytes[currentIndex : currentIndex+contractAddressLength])
-		bytesContractAddress, err := hex.DecodeString(strings.TrimPrefix(auth.ContractAddress, "0x"))
-		if err != nil {
-			return nil, fmt.Errorf("invalid contract address: %v", err)
-		}
-		currentIndex += contractAddressLength
-
-		nonceLength := binary.LittleEndian.Uint64(decodedBytes[currentIndex : currentIndex+8])
-		currentIndex += 8
-
-		auth.Nonce = string(decodedBytes[currentIndex : currentIndex+nonceLength])
-		nonce, err := strconv.ParseUint(strings.TrimPrefix(auth.Nonce, "0x"), 16, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid nonce: %v", err)
-		}
-		currentIndex += nonceLength
-
-		yParityLength := binary.LittleEndian.Uint64(decodedBytes[currentIndex : currentIndex+8])
-		currentIndex += 8
-
-		auth.YParity = string(decodedBytes[currentIndex : currentIndex+yParityLength])
-		vHex := strings.TrimPrefix(auth.YParity, "0x")
-		if len(vHex)%2 != 0 {
-			vHex = "0" + vHex
-		}
-		v, err := hex.DecodeString(vHex)
-		if err != nil {
-			return nil, fmt.Errorf("invalid yParity: %v", err)
-		}
-		currentIndex += yParityLength
-
-		rLength := binary.LittleEndian.Uint64(decodedBytes[currentIndex : currentIndex+8])
-		currentIndex += 8
-
-		auth.R = string(decodedBytes[currentIndex : currentIndex+rLength])
-		rHex := strings.TrimPrefix(auth.R, "0x")
-		if len(rHex)%2 != 0 {
-			rHex = "0" + rHex
-		}
-		r, err := hex.DecodeString(rHex)
-		if err != nil {
-			return nil, fmt.Errorf("invalid r: %v", err)
-		}
-		currentIndex += rLength
-
-		sLength := binary.LittleEndian.Uint64(decodedBytes[currentIndex : currentIndex+8])
-		currentIndex += 8
-
-		auth.S = string(decodedBytes[currentIndex : currentIndex+sLength])
-		sHex := strings.TrimPrefix(auth.S, "0x")
-		if len(sHex)%2 != 0 {
-			sHex = "0" + sHex
-		}
-		s, err := hex.DecodeString(sHex)
-		if err != nil {
-			return nil, fmt.Errorf("invalid s: %v", err)
-		}
-		currentIndex += sLength
-
-		encoded, err := rlp.EncodeToBytes(struct {
-			ChainId         uint64
-			ContractAddress []byte
-			Nonce           uint64
-		}{
-			ChainId:         chainId,
-			ContractAddress: bytesContractAddress,
-			Nonce:           nonce,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to encode authorization: %v", err)
-		}
-
-		hash := crypto.Keccak256Hash(append([]byte{0x05}, encoded...))
-		auth.Hash = hash.Hex()
-
-		sig := make([]byte, 65)
-		copy(sig[32-len(r):32], r)
-		copy(sig[64-len(s):64], s)
-		sig[64] = v[len(v)-1]
-		recoveredPubKey, err := crypto.Ecrecover(hash.Bytes(), sig)
-		if err != nil {
-			log.Printf("Failed to recover public key for authorization")
-			log.Printf("Hash: %s", auth.Hash)
-			log.Printf("R: %s", auth.R)
-			log.Printf("S: %s", auth.S)
-			log.Printf("V: %s", auth.YParity)
-			log.Printf("Signature: %s", hex.EncodeToString(sig))
-			return nil, fmt.Errorf("failed to recover public key: %v", err)
-		}
-
-		// 4. Convert Public Key Bytes to Ethereum Address
-		pubKey, err := crypto.UnmarshalPubkey(recoveredPubKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to unmarshal public key: %v", err)
-		}
-		auth.Authority = "0x" + hex.EncodeToString(crypto.PubkeyToAddress(*pubKey).Bytes())
-
-		result = append(result, auth)
-	}
-
-	return result, nil
 }

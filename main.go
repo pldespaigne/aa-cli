@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"log"
+	"log/slog"
 
 	"github.com/pldespaigne/aa-cli/pkg/config"
 	"github.com/pldespaigne/aa-cli/pkg/envio"
@@ -14,12 +16,17 @@ func main() {
 		log.Fatalf("Config validation failed: %v", err)
 	}
 
-	client := envio.NewEnvioClient(uint64(1), cfg.EnvioApiToken)
+	client := envio.NewClient(cfg.EnvioApiToken,
+		envio.WithRetryMaxTries(cfg.RetryMaxTries),
+		envio.WithRetryInitialInterval(cfg.RetryInitialInterval),
+		envio.WithRetryMaxInterval(cfg.RetryMaxInterval),
+		envio.WithRetryMaxElapsedTime(cfg.RetryMaxElapsedTime),
+	)
 
-	query := envio.EnvioQuery{
+	query := envio.Query{
 		FromBlock: 22_431_084,
-		Logs:      []envio.EnvioLogSelection{},
-		Transactions: []envio.EnvioTransactionSelection{
+		Logs:      []envio.LogSelection{},
+		Transactions: []envio.TransactionSelection{
 			{
 				From:            []string{},
 				To:              []string{},
@@ -29,11 +36,11 @@ func main() {
 				ContractAddress: []string{},
 			},
 		},
-		Traces: []envio.EnvioTraceSelection{},
-		FieldSelection: envio.EnvioFieldSelection{
+		Traces: []envio.TraceSelection{},
+		FieldSelection: envio.FieldSelection{
 			Transaction: &[]string{"hash", "authorization_list"},
 		},
-		IncludeAllblocks: false,
+		IncludeAllBlocks: false,
 		JoinMode:         envio.JoinNothingMode,
 	}
 
@@ -46,7 +53,9 @@ func main() {
 		Transactions []TxData `json:"transactions"`
 	}
 
-	blocks, err := envio.ExecuteAll[BlockData](client, query)
+	logger := slog.Default()
+
+	blocks, err := envio.ExecuteAll[BlockData](context.Background(), client, query, client.GetLogger())
 	if err != nil {
 		log.Fatalf("Failed to execute query: %v", err)
 	}
@@ -63,9 +72,9 @@ func main() {
 	contracts := make(map[string]struct{})
 
 	for _, tx := range txs {
-		auths, err := envio.DecodeAuthorizationList(tx.AuthorizationList)
+		auths, err := envio.DecodeAuthorizationList(logger, tx.AuthorizationList)
 		if err != nil {
-			log.Printf("Failed to decode authorization list for transaction %s: %v", tx.Hash, err)
+			slog.Warn("failed to decode authorization list", "tx_hash", tx.Hash, "error", err)
 			continue
 		}
 		for _, auth := range auths {
@@ -81,6 +90,5 @@ func main() {
 		}
 	}
 
-	log.Printf("Unique authorities: %d", len(authorities))
-	log.Printf("Unique contracts: %d", len(contracts))
+	slog.Info("analysis complete", "unique_authorities", len(authorities), "unique_contracts", len(contracts))
 }
